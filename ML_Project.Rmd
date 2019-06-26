@@ -1,0 +1,486 @@
+---
+title: "Predictions using the Human Activity Recognition Dataset"
+author: "Csaba Iranyi"
+output: 
+  html_document
+---
+
+## The Question
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.  
+ 
+In this project, I will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants.  
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions:  
+  
+Movement type | Class
+------------- | -------------
+Exactly according to the specification  | Class A
+Throwing the elbows to the front  | Class B
+Lifting the dumbbell only halfway  | Class C
+Lowering the dumbbell only halfway  | Class D
+Throwing the hips to the fron  | Class E
+  
+Based on a dataset provide by Human Activity Recognition (HAR) [http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) I will try:  
+
+* to train and evaluate some multi-class classification predictive models using the training dataset with 159 features and one label (classe),
+* to use the trained prediction models to predict 20 different test cases (what exercise was performed) from the testing dataset.
+
+## Getting data
+
+```{r warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=5)
+options(width=120)
+
+library(caret)
+library(randomForest)
+library(ggcorrplot)
+library(ggpubr)
+```
+
+Downloading of traning and testing datasets.  
+
+```{r}
+# Downloading training dataset
+training.data <- read.table(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                            header = TRUE, 
+                            sep = ",", 
+                            encoding = "ISO_8859-1")
+
+# Downloading training dataset
+testing.data <- read.table(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+                           header = TRUE, 
+                           sep = ",", 
+                           encoding = "ISO_8859-1")
+```
+
+## Exploratory data analysis
+
+Examining the dimensions and the features of the training dataset. 
+```{r}
+# Number of features
+cat("Number of features in training dataset:", length(names(training.data)) - 1, "\n")
+cat("Number of features in testing dataset:", length(names(training.data)) - 1, "\n")
+
+# Number of rows
+cat("Number of observations in training dataset:", nrow(training.data), "\n")
+cat("Number of observations in testing dataset:", nrow(testing.data), "\n")
+
+# Create summary of features (and label)
+feature.summary <- data.frame(row.names = 1:length(names(training.data)))
+feature.summary$feature.index <- 1:length(names(training.data))
+feature.summary$feature.name <- names(training.data)
+feature.summary$type <- sapply(training.data, class)
+feature.summary$NA.rows <- sapply(training.data, function(x) sum(is.na(x)))
+feature.summary$NA.rows.percent <- sapply(training.data, function(x) round(sum(is.na(x)) / length(x) * 100.0, digits = 2)) 
+feature.summary$empty.rows <- sapply(training.data, function(x) length(x[x == ""]))
+feature.summary$empty.rows.percent <- sapply(training.data, function(x) round(length(x[x == ""]) / length(x) * 100.0, digits = 2))
+feature.summary$unique.values <- sapply(training.data, function(x) length(unique(x)))
+feature.summary[, -1]
+```
+
+Lot of features has either NA or empty values in great percent.
+
+## Cleaning data
+
+### Removing useless features
+
+Removing constant features and features with NA or empty rows from the training and testing data as well.
+```{r}
+
+# Removing useless features
+#  - Constant features
+#  - Features with NA rows
+#  - Features with empty rows
+useless.feature.indices <- feature.summary[feature.summary$unique.values == 1 | feature.summary$NA.rows != 0 | feature.summary$empty.rows !=0, 1]
+cat("Number of removable useless features:", length(useless.feature.indices), "\n")
+training.data <- training.data[, -useless.feature.indices]
+testing.data <- testing.data[, -useless.feature.indices]
+```
+
+### Removing unnecessary features
+
+Removing the sequence feature (X) and all time related features () from the training and testing data.
+```{r}
+# Removing unnecessary features
+unnecessary.feature.indices <- grep("timestamp|X", names(training.data))
+cat("Number of removable unnecessary features:", length(unnecessary.feature.indices), "\n")
+training.data <- training.data[, -unnecessary.feature.indices]
+testing.data <- testing.data[, -unnecessary.feature.indices]
+```
+
+### Converting  features
+
+Converting all features to numeric type (except the label column).
+```{r}
+# Converting all features to numeric type (except the label column)
+label.column <- training.data$classe
+training.data <- data.frame(data.matrix(training.data))
+training.data$classe <- label.column
+testing.data <- data.frame(data.matrix(testing.data))
+
+# Number of usable features
+cat("Number of usable features:", length(names(training.data)) - 1, "\n")
+```
+
+## Splitting data
+
+The downloaded test dataset (20 observations) is the the ultimate validation set (one time scoring).  
+Splitting up the downloaded training dataset into a cross-validating (25%) and training dataset (75%).
+```{r}
+# Initialize RNG
+set.seed(333)
+
+# Crete training/CV datasets
+partition.indices <- createDataPartition(y = training.data$classe, p = 0.75, list = FALSE)
+cv.data <- training.data[-partition.indices,]
+training.data <- training.data[partition.indices,]
+
+cat("Number of rows in training dataset:", nrow(training.data), "\n")
+cat("Number of rows in cross-validation dataset:", nrow(cv.data), "\n")
+cat("Number of rows in testing dataset:", nrow(testing.data), "\n")
+```
+
+## Feature engineering
+
+### Finding feature correlations
+
+Calculating feature correlations with the outcome (classe).
+```{r}
+# Label (outcome) column index
+label.index <- which(names(training.data) == "classe")
+
+# Create summary of usable features
+feature.set <- training.data[,-label.index]
+feature.summary <- data.frame(row.names = 1:length(names(feature.set)))
+feature.summary$feature.index <- 1:length(names(feature.set))
+feature.summary$feature.name <- names(feature.set)
+feature.summary$type <- sapply(feature.set, class)
+feature.summary$unique <- sapply(feature.set, function(x) length(unique(x)))
+feature.summary$mean <- sapply(feature.set, function(x) round(mean(x), digits = 4))
+feature.summary$sum <- sapply(feature.set, function(x) round(sum(x), digits = 4))
+feature.summary$sd <- sapply(feature.set, function(x) round(sd(x), digits = 4))
+feature.summary$cor <- sapply(feature.set, function(x) round(abs(cor(x, as.numeric(training.data$classe))), digits = 4))
+feature.summary <- feature.summary[order(feature.summary$cor, decreasing = TRUE),]
+feature.summary[, -1]
+```
+
+Selecting 33 (manually choosen number) features with best correlations with outcome.
+```{r}
+# The most relevant features (best correlations with outcome)
+most.correlated.outcome.feature.indices <- feature.summary$feature.index[1:33]
+cat("Relevant features:", feature.summary$feature.name[1], "...", feature.summary$feature.name[33], "\n")
+```
+
+Searching for duplicated (lineary dependent) features to reduce pair-wise correlations.
+```{r}
+# Duplicated feature
+feature.correlation.matrix <- cor(training.data[, -label.index])
+duplicated.feature.indices <- findCorrelation(feature.correlation.matrix, cutoff = 0.9, exact = TRUE)
+cat("Removable duplicated features:", paste(names(training.data)[duplicated.feature.indices], collapse = ", "), "\n")
+
+# Plot correlation matrix
+ggcorrplot(feature.correlation.matrix, hc.order = TRUE, type = "lower", colors = c("red", "white", "red"), insig = "blank", tl.cex = list(size = 4))
+```
+  
+## Training and scoring models 
+
+Creating a summary dataset to store result of trained models.
+```{r}
+# Summary of models
+model.summary <- data.frame(row.names = 1:6, stringsAsFactors = TRUE)
+
+# Initialize RNG
+set.seed(333)
+```
+
+Setting options of random forest.
+```{r}
+# Number of trees
+number.trees <- 50
+```
+ 
+### Random Forest: using all features 
+
+```{r}
+# Random Forest: all features
+start.time <- Sys.time()
+model.all.features <- randomForest(
+  x = training.data[, -label.index], 
+  y = training.data$classe,
+  xtest = cv.data[, -label.index], 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.all.features$ntree,
+  features = ncol(training.data) - 1,
+  model = "All features",
+  training.accuracy = round((1 - sum(model.all.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy =round((1 - sum(model.all.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Random Forest: all features with PCA 
+
+```{r}
+# Apply PCA
+pre.pca <- preProcess(training.data[, -label.index], method = "pca", thresh = 0.99)
+training.data.pca <- predict(pre.pca, training.data[, -label.index])
+cv.data.pca <- predict(pre.pca, cv.data[, -label.index])
+testing.data.pca <- predict(pre.pca, testing.data[, -label.index])
+
+# Random Forest: all feature with PCA
+start.time <- Sys.time()
+model.pca.features <- randomForest(
+  x = training.data.pca, 
+  y = training.data$classe,
+  xtest = cv.data.pca, 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.pca.features$ntree,
+  features = ncol(training.data.pca),
+  model = "PCA",
+  training.accuracy = round((1 - sum(model.pca.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy = round((1 - sum(model.pca.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Random Forest: the most correlated features 
+
+```{r}
+# Random Forest: the most correlated features
+start.time <- Sys.time()
+model.corr.features <- randomForest(
+  x = training.data[, most.correlated.outcome.feature.indices], 
+  y = training.data$classe,
+  xtest = cv.data[, most.correlated.outcome.feature.indices], 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.corr.features$ntree,
+  features = ncol(training.data[, most.correlated.outcome.feature.indices]),
+  model = "Correlated",
+  training.accuracy = round((1 - sum(model.corr.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy = round((1 - sum(model.corr.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Random Forest: the most correlated features with PCA
+
+```{r}
+# Apply PCA
+pre.corr.pca <- preProcess(training.data[, most.correlated.outcome.feature.indices], method = "pca", thresh = 0.99)
+training.data.corr.pca <- predict(pre.corr.pca, training.data[, most.correlated.outcome.feature.indices])
+cv.data.corr.pca <- predict(pre.corr.pca, cv.data[, most.correlated.outcome.feature.indices])
+testing.data.corr.pca <- predict(pre.corr.pca, testing.data[, most.correlated.outcome.feature.indices])
+
+# Random Forest: the most correlated features with PCA
+start.time <- Sys.time()
+model.corr.pca.features <- randomForest(
+  x = training.data.corr.pca, 
+  y = training.data$classe,
+  xtest = cv.data.corr.pca, 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.corr.pca.features$ntree,
+  features = ncol(training.data.corr.pca),
+  model = "Correlated + PCA",
+  training.accuracy = round((1 - sum(model.corr.pca.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy = round((1 - sum(model.corr.pca.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Random Forest: reduced features
+
+```{r}
+# Random Forest: reduced features
+start.time <- Sys.time()
+model.reduced.features <- randomForest(
+  x = training.data[, -c(duplicated.feature.indices, label.index)], 
+  y = training.data$classe,
+  xtest = cv.data[, -c(duplicated.feature.indices, label.index)], 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.reduced.features$ntree,
+  features = ncol(training.data[, -c(duplicated.feature.indices, label.index)]),
+  model = "Reduced",
+  training.accuracy = round((1 - sum(model.reduced.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy = round((1 - sum(model.reduced.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Random Forest: reduced features with PCA
+
+```{r}
+# Apply PCA
+pre.reduced.pca <- preProcess(training.data[, -c(duplicated.feature.indices, label.index)], method = "pca", thresh = 0.99)
+training.data.reduced.pca <- predict(pre.reduced.pca, training.data[, -c(duplicated.feature.indices, label.index)])
+cv.data.reduced.pca <- predict(pre.reduced.pca, cv.data[, -c(duplicated.feature.indices, label.index)])
+testing.data.reduced.pca <- predict(pre.reduced.pca, testing.data[, -c(duplicated.feature.indices, label.index)])
+
+# Random Forest: reduced features with PCA
+start.time <- Sys.time()
+model.reduced.pca.features <- randomForest(
+  x = training.data.reduced.pca, 
+  y = training.data$classe,
+  xtest = cv.data.reduced.pca, 
+  ytest = cv.data$classe, 
+  ntree = number.trees,
+  keep.forest = TRUE,
+  proximity = TRUE,
+  do.trace = FALSE)
+end.time <- Sys.time()
+
+model.summary <- rbind(model.summary, cbind( 
+  trees = model.reduced.pca.features$ntree,
+  features = ncol(training.data.reduced.pca),
+  model = "Reduced + PCA",
+  training.accuracy = round((1 - sum(model.reduced.pca.features$confusion[,"class.error"])) * 100, digits = 3),
+  cv.accuracy = round((1 - sum(model.reduced.pca.features$test$confusion[,"class.error"])) * 100, digits = 3),
+  training.time = round(as.numeric(end.time - start.time, units = "secs"))
+))
+```
+
+### Summary of models
+
+Summarizing the trained models.
+```{r}
+model.summary$trees = as.numeric(as.character(model.summary$trees))
+model.summary$features = as.numeric(as.character(model.summary$features))
+model.summary$training.accuracy = as.numeric(as.character(model.summary$training.accuracy))
+model.summary$cv.accuracy = as.numeric(as.character(model.summary$cv.accuracy))
+model.summary$training.time = as.numeric(as.character(model.summary$training.time))
+model.summary
+```
+
+Plotting the cross-validating accuracy.  
+```{r}
+# Cross-validating accuracy chart
+gg <- ggbarplot(
+  model.summary, x = "model", y = "cv.accuracy",
+  title = "Cross-validating accuracy (%)",      # Main title
+  fill = "model",                               # Color by groups
+  sort.val = "desc",                            # Sort value in descending order
+  label = model.summary$cv.accuracy,            # Label values
+  lab.pos = "in",                               # Position for labels
+  lab.col = "white",                            # Color for labels
+  lab.nb.digits = 2,                            # Number of decimal places (round)
+  xlab = FALSE,                                 # X-axis labels
+  ylab = FALSE,                                 # Y-axis labels
+  rotate = FALSE,                               # Rotate vertically
+  font.label = list(color = "white", size = 11, vjust = 1.5),
+  ggtheme = theme_pubr()                        # ggplot2 theme
+) 
+ggpar(gg, legend = "none", legend.title = "")   # Customize legend
+```
+
+Plotting the training times in seconds.  
+```{r}
+# Training time chart
+gg <- ggdotchart(
+  model.summary, x = "model", y = "training.time",
+  title = "Training time (sec)",                # Main title
+  color = "model",                              # Color by groups
+  sorting = "descending",                       # Sort value in descending order
+  rotate = FALSE,                               # Rotate vertically
+  label = model.summary$training.time,          # Label values
+  add = "segments",                             # Add lolipop lines
+  xlab = FALSE,                                 # X-axis labels
+  ylab = FALSE,                                 # Y-axis labels
+  dot.size = 10,                                # Large dot size
+  y.text.col = TRUE,                            # Color y text by groups
+  font.label = list(color = "white", size = 11, face = "bold", vjust = 0.5),
+  ggtheme = theme_pubr(),                        # ggplot2 theme
+) 
+ggpar(gg, legend = "none", legend.title = "",  ylim = c(min(model.summary$training.time) * 0.95, max(model.summary$training.time) * 1.05)) + theme_cleveland()
+```
+
+## Testing models
+
+Using all of trained models to make predictions on the test dataset (20 observations). The ground truth dataset consist of the expected good values.
+```{r}
+# Predictions of the models
+test.predictions <- data.frame(row.names = 1:20, stringsAsFactors = TRUE)
+test.predictions$ground.truth <- as.factor(c("B", "A", "B", "A", "A", "E", "D", "B", "A", "A", "B", "C", "B", "A", "E", "E", "A", "B", "B", "B"))
+test.predictions$all <- predict(model.all.features, testing.data[,-label.index])
+test.predictions$all.with.pca <- predict(model.pca.features, testing.data.pca)
+test.predictions$correlated <- predict(model.corr.features, testing.data[, most.correlated.outcome.feature.indices])
+test.predictions$corr.with.pca <- predict(model.corr.pca.features, testing.data.corr.pca)
+test.predictions$reduced <- predict(model.reduced.features, testing.data[, -c(duplicated.feature.indices, label.index)])
+test.predictions$reduced.with.pca <- predict(model.reduced.pca.features, testing.data.reduced.pca)
+test.predictions
+
+# Calculating testing accuracies
+model.summary$testing.accuracy <- c(
+  sum(equals(test.predictions$ground.truth, test.predictions$all)) / nrow(test.predictions) * 100,
+  sum(equals(test.predictions$ground.truth, test.predictions$all.with.pca)) / nrow(test.predictions) * 100,
+  sum(equals(test.predictions$ground.truth, test.predictions$all.with.pca)) / nrow(test.predictions) * 100,
+  sum(equals(test.predictions$ground.truth, test.predictions$correlated)) / nrow(test.predictions) * 100,
+  sum(equals(test.predictions$ground.truth, test.predictions$corr.with.pca)) / nrow(test.predictions) * 100,
+  sum(equals(test.predictions$ground.truth, test.predictions$reduced.with.pca)) / nrow(test.predictions) * 100
+)
+```
+
+Plotting the final testing accuracy for 20 observations.
+```{r}
+# Testing accuracy chart
+gg <- ggbarplot(
+  model.summary, x = "model", y = "testing.accuracy",
+  title = "Testing accuracy (%)",                # Main title
+  fill = "model",                                # Color by groups
+  sort.val = "desc",                             # Sort value in descending order
+  label = model.summary$testing.accuracy,        # Label values
+  lab.pos = "in",                                # Position for labels
+  lab.col = "white",                             # Color for labels
+  lab.nb.digits = 2,                             # Number of decimal places (round)
+  xlab = FALSE,                                  # X-axis labels
+  ylab = FALSE,                                  # Y-axis labels
+  rotate = FALSE,                                # Rotate vertically
+  font.label = list(color = "white", size = 11, vjust = 1.5),
+  ggtheme = theme_pubr()                         # ggplot2 theme
+) 
+ggpar(gg, legend = "none", legend.title = "")    # Customize legend
+```
+
+## Conclusion
+
+Using all features to train the model give us an appropriate cross-validating and testing accuracy.  
+However the reduced features provide more validating accuracy.
+
+Plotting the error rate tendency of the first trained model.  
+```{r}
+plot(model.all.features, main = "Error rate tendency")
+```
+The error rate doesn't decline a lot after 50 trees.
